@@ -1,4 +1,10 @@
-# NISQA: Speech Quality and Naturalness Assessment
+# NISQA PyTorch Optimized: Speech Quality and Naturalness Assessment
+
+This repository preserves the original NISQA training and command-line
+interfaces while providing a modern, GPU-aware PyTorch inference path. The
+optimized path is intentionally conservative: it keeps checkpoint outputs and
+variable-length padding semantics stable, then applies safe inference-only
+optimizations where the model contract permits them.
 
 *+++ News: The NISQA model has recently been updated to NISQA v2.0. The new version offers multidimensional predictions with higher accuracy and allows for training and finetuning the model.*
 
@@ -30,25 +36,42 @@ More information about the deep learning model structure, the used training data
 
 ## Installation
 
-To install requirements install [Anaconda](https://www.anaconda.com/products/individual) and then use:
+The base Conda environment contains Python and audio system libraries. Create
+it first:
 
-```setup
+```bash
 conda env create -f env.yml
+conda activate nisqa-pytorch
 ```
 
-This will create a new environment with the name "nisqa". Activate this environment to go on:
+For the verified NVIDIA CUDA thirteen point zero stack on Linux:
 
-```setup2
-conda activate nisqa
+```bash
+python -m pip install -r requirements-gpu-cu130.txt
+```
+
+For a CPU-only environment, use `requirements-cpu.txt` instead. The GPU pins
+are `torch 2.13.0+cu130`, `torchvision 0.28.0+cu130`, and
+`torchaudio 2.11.0+cu130`. They are selected from PyTorch's CUDA wheel index,
+not from an unpinned package resolver.
+
+Verify the installation before running inference:
+
+```bash
+python - <<'PY'
+import torch
+assert torch.cuda.is_available(), torch.cuda.get_device_name(0)
+print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
+PY
 ```
 
 ### Modern PyTorch inference
 
 The repository keeps the original command-line and training interfaces while
-also exposing a small PyTorch 2.x inference API. It loads bundled checkpoints
-with PyTorch's restricted `weights_only` loader, uses
-`torch.inference_mode()`, caches repeated mel filter banks, and preserves the
-checkpoint state dictionaries.
+also exposing a small PyTorch 2.x inference API. It loads bundled
+checkpoints with PyTorch's restricted `weights_only` loader, returns models in
+`eval()` mode, uses `torch.inference_mode()`, caches repeated mel filter banks,
+and preserves checkpoint state dictionaries.
 
 ```python
 import torch
@@ -60,12 +83,27 @@ n_wins = torch.tensor([128, 120, 96, 80])
 prediction = predict_batch(model, features, n_wins)
 ```
 
-The model uses a dense LSTM fast path when every item in a batch fills the
-padded time axis. Variable-length batches retain packed sequences, so padding
-semantics do not change. PyTorch's current `torch.compile` path does not
-support that dynamic packed CNN/LSTM graph reliably, so this repository keeps
-eager inference as the supported path instead of silently falling back or
-changing padding semantics.
+Inference policy is shape-aware:
+
+- Fully valid padded batches use dense CNN/LSTM execution in eval mode.
+- Mixed-length batches retain packed sequences and exact valid-window masks.
+- CPU `n_wins` is supported, avoiding unnecessary length-tensor transfers.
+- CUDA DataLoaders use pinned memory and non-blocking feature transfers.
+
+`torch.compile` is supported as an opt-in optimization for fixed-shape,
+fully-valid buckets. Warm it up before measuring steady-state latency:
+
+```python
+compiled_model = torch.compile(model, backend="inductor")
+with torch.inference_mode():
+    prediction = compiled_model(features, torch.tensor([128, 128, 128, 128]))
+```
+
+Do not compile mixed-length packed batches by default. On the verified CUDA
+stack, fixed-shape Inductor inference preserved finite outputs with maximum
+absolute differences below `5e-5`, but compilation overhead must be amortized
+across repeated calls. Eager inference remains the default because it is the
+stable path for arbitrary batch lengths.
 
 
 ## Using NISQA

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 
+import nisqa.NISQA_lib as NISQA_lib
 from nisqa import load_model, predict_batch
 from nisqa.NISQA_lib import PositionalEncoding, _mel_filter_bank, get_librosa_melspec
 
@@ -51,6 +52,20 @@ def test_packed_sequence_path_accepts_unsorted_lengths() -> None:
     features = torch.randn((2, 8, 1, 48, 15), generator=torch.Generator().manual_seed(216))
     output = predict_batch(model, features, torch.tensor([5, 8]))
     assert output.shape == (2, 1)
+    assert torch.isfinite(output).all()
+
+
+def test_framewise_uses_dense_path_for_full_eval_batches(monkeypatch) -> None:
+    model = load_model(ROOT / "weights" / "nisqa_tts.tar")
+    features = torch.randn((2, 12, 1, 48, 15), generator=torch.Generator().manual_seed(216))
+
+    def fail_if_packed(*args, **kwargs):
+        raise AssertionError("full eval batches should use the dense CNN path")
+
+    monkeypatch.setattr(NISQA_lib, "pack_padded_sequence", fail_if_packed)
+    with torch.inference_mode():
+        output = model.cnn(features, torch.tensor([12, 12]))
+    assert output.shape[:2] == (2, 12)
     assert torch.isfinite(output).all()
 
 

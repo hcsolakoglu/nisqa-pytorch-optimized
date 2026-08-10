@@ -492,6 +492,10 @@ class Framewise(nn.Module):
         
     def forward(self, x, n_wins):
         (bs, length, channels, height, width) = x.shape
+        if not self.training and n_wins.numel() and bool(torch.all(n_wins == length)):
+            x = self.model(x.reshape(bs * length, channels, height, width))
+            return x.reshape(bs, length, -1)
+
         x_packed = pack_padded_sequence(
                 x,
                 n_wins.cpu(),
@@ -501,8 +505,8 @@ class Framewise(nn.Module):
         x = self.model(x_packed.data) 
         x = x_packed._replace(data=x)                
         x, _ = pad_packed_sequence(
-            x, 
-            batch_first=True, 
+            x,
+            batch_first=True,
             padding_value=0.0,
             total_length=int(n_wins.max()))
         return x    

@@ -2,6 +2,7 @@
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["compile: verify optional torch.compile inference behavior"]
 
 [tool.ruff]
 line-length = 120

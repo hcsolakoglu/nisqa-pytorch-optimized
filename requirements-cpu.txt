@@ -1,0 +1,18 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu
+torchaudio==2.11.0+cpu
+
+numpy==2.4.6
+scipy==1.18.0
+librosa==0.11.0
+matplotlib==3.11.1
+pandas==3.0.5
+PyYAML==6.0.3
+scikit-learn==1.9.0
+tqdm==4.69.0
+numba==0.66.0
+Pillow==12.3.0
+soundfile==0.14.0
