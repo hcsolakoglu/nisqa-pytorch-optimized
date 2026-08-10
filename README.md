@@ -55,12 +55,24 @@ are `torch 2.13.0+cu130`, `torchvision 0.28.0+cu130`, and
 `torchaudio 2.11.0+cu130`. They are selected from PyTorch's CUDA wheel index,
 not from an unpinned package resolver.
 
-Verify the installation before running inference:
+Verify the installation before running inference. For a CPU-only installation:
 
 ```bash
 python - <<'PY'
 import torch
-assert torch.cuda.is_available(), torch.cuda.get_device_name(0)
+if torch.cuda.is_available():
+    raise SystemExit("The CPU requirements unexpectedly expose CUDA")
+print(torch.__version__, "device=cpu")
+PY
+```
+
+For the CUDA installation:
+
+```bash
+python - <<'PY'
+import torch
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is unavailable; install requirements-cpu.txt for CPU inference")
 print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))
 PY
 ```
@@ -99,11 +111,15 @@ with torch.inference_mode():
     prediction = compiled_model(features, torch.tensor([128, 128, 128, 128]))
 ```
 
-Do not compile mixed-length packed batches by default. On the verified CUDA
-stack, fixed-shape Inductor inference preserved finite outputs with maximum
-absolute differences below `5e-5`, but compilation overhead must be amortized
-across repeated calls. Eager inference remains the default because it is the
-stable path for arbitrary batch lengths.
+Do not compile mixed-length packed batches by default. Inductor is an opt-in
+performance path, not a universal numerical-equivalence guarantee: backend
+versions and floating-point kernel choices can change the last digits, and the
+length-aware branch may introduce graph breaks. In a local CUDA thirteen point
+zero probe on this RTX 3070, `nisqa_tts` with a fixed `4 x 128` bucket produced a
+finite result with a maximum absolute difference of `5.94e-4` from eager
+inference. Establish an eager reference and choose an application-specific
+`tolerance` for every checkpoint and shape before deploying Inductor. Keep eager
+inference as the default when strict reproducibility matters.
 
 
 ## Using NISQA
