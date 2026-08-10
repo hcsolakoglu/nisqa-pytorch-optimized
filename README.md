@@ -42,6 +42,30 @@ This will create a new environment with the name "nisqa". Activate this environm
 conda activate nisqa
 ```
 
+### Modern PyTorch inference
+
+The repository keeps the original command-line and training interfaces while
+also exposing a small PyTorch 2.x inference API. It loads bundled checkpoints
+with PyTorch's restricted `weights_only` loader, uses
+`torch.inference_mode()`, caches repeated mel filter banks, and preserves the
+checkpoint state dictionaries.
+
+```python
+import torch
+from nisqa import load_model, predict_batch
+
+model = load_model("weights/nisqa.tar", device="cuda")
+features = torch.randn(4, 128, 1, 48, 15, device="cuda")
+n_wins = torch.tensor([128, 120, 96, 80])
+prediction = predict_batch(model, features, n_wins)
+```
+
+The model uses a dense LSTM fast path when every item in a batch fills the
+padded time axis. Variable-length batches retain packed sequences, so padding
+semantics do not change. PyTorch's current `torch.compile` path does not
+support that dynamic packed CNN/LSTM graph reliably, so this repository keeps
+eager inference as the supported path instead of silently falling back or
+changing padding semantics.
 
 
 ## Using NISQA

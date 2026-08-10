@@ -6,6 +6,7 @@ import os
 import multiprocessing
 import copy
 import math
+from functools import lru_cache
 
 import librosa as lb
 import numpy as np
@@ -25,14 +26,23 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
 
+def _valid_window_mask(length, n_wins, device):
+    """Return a device-local mask for valid sequence steps."""
+    lengths = n_wins.to(device=device, dtype=torch.long)
+    steps = torch.arange(length, device=device)
+    return steps.unsqueeze(0) < lengths.unsqueeze(1)
+
+
 #%% Models
 class NISQA(nn.Module):
-    '''
-    NISQA: The main speech quality model without speech quality dimension 
-    estimation (MOS only). The module loads the submodules for framewise 
-    modelling (e.g. CNN), time-dependency modelling (e.g. Self-Attention     
-    or LSTM), and pooling (e.g. max-pooling or attention-pooling)                                                  
-    '''       
+    """NISQA MOS-only model.
+
+    ``n_wins`` is intentionally a CPU tensor at inference time. The model
+    copies it to the active device only for masks and keeps packed-sequence
+    length handling off the CUDA synchronization path.
+    """
+
+    supports_cpu_n_wins = True
     def __init__(self,
             ms_seg_length=15,
             ms_n_mels=48,
@@ -144,13 +154,9 @@ class NISQA(nn.Module):
 
 
 class NISQA_DIM(nn.Module):
-    '''
-    NISQA_DIM: The main speech quality model with speech quality dimension 
-    estimation (MOS, Noisiness, Coloration, Discontinuity, and Loudness).
-    The module loads the submodules for framewise modelling (e.g. CNN),
-    time-dependency modelling (e.g. Self-Attention or LSTM), and pooling 
-    (e.g. max-pooling or attention-pooling)                                                  
-    '''         
+    """NISQA MOS plus dimension model with CPU ``n_wins`` support."""
+
+    supports_cpu_n_wins = True
     def __init__(self,
             ms_seg_length=15,
             ms_n_mels=48,
@@ -498,7 +504,7 @@ class Framewise(nn.Module):
             x, 
             batch_first=True, 
             padding_value=0.0,
-            total_length=n_wins.max())
+            total_length=int(n_wins.max()))
         return x    
 
 class SkipCNN(nn.Module):
@@ -914,7 +920,9 @@ class LSTM(nn.Module):
                 dropout = dropout,
                 batch_first = True,
                 bidirectional = bidirectional
-                )      
+                )
+
+        self._flattened_device = None
             
         if bidirectional:
             num_directions = 2
@@ -923,23 +931,33 @@ class LSTM(nn.Module):
         self.fan_out = num_directions*lstm_h
 
     def forward(self, x, n_wins):
-        
+
+        lengths = n_wins.detach().to(device="cpu", dtype=torch.long)
+        if lengths.numel() and bool(torch.all(lengths == x.shape[1])):
+            if self._flattened_device != x.device:
+                self.lstm.flatten_parameters()
+                self._flattened_device = x.device
+            return self.lstm(x)[0], n_wins
+
+        enforce_sorted = bool(torch.all(lengths[:-1] >= lengths[1:])) if len(lengths) > 1 else True
         x = pack_padded_sequence(
                 x,
-                n_wins.cpu(),
+                lengths,
                 batch_first=True,
-                enforce_sorted=False
-                )             
-        
-        self.lstm.flatten_parameters()
+                enforce_sorted=enforce_sorted
+                )
+
+        if self._flattened_device != x.data.device:
+            self.lstm.flatten_parameters()
+            self._flattened_device = x.data.device
         x = self.lstm(x)[0]
-        
+
         x, _ = pad_packed_sequence(
-            x, 
-            batch_first=True, 
+            x,
+            batch_first=True,
             padding_value=0.0,
-            total_length=n_wins.max())          
-  
+            total_length=int(lengths.max()))
+
         return x, n_wins
 
 class SelfAttention(nn.Module):
@@ -987,13 +1005,13 @@ class SelfAttention(nn.Module):
 
     def forward(self, src, n_wins=None):            
         src = self.linear(src)
-        output = src.transpose(1,0)
+        output = src
         output = self.norm1(output)
         output = self.pos_encoder(output)
-        
+
         for mod in self.layers:
             output, n_wins = mod(output, n_wins=n_wins)
-        return output.transpose(1,0), n_wins
+        return output, n_wins
 
 class SelfAttentionLayer(nn.Module):
     '''
@@ -1003,7 +1021,12 @@ class SelfAttentionLayer(nn.Module):
     def __init__(self, d_model, nhead, pool_size=1, sa_h=2048, dropout=0.1, activation="relu"):
         super().__init__()
         
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
         
         self.linear1 = nn.Linear(d_model, sa_h)
         self.dropout = nn.Dropout(dropout)
@@ -1025,11 +1048,17 @@ class SelfAttentionLayer(nn.Module):
     def forward(self, src, n_wins=None):
         
         if n_wins is not None:
-            mask = ~((torch.arange(src.shape[0])[None, :]).to(src.device) < n_wins[:, None].to(torch.long).to(src.device))
+            mask = ~_valid_window_mask(src.shape[1], n_wins, src.device)
         else:
             mask = None
         
-        src2 = self.self_attn(src, src, src, key_padding_mask=mask)[0]
+        src2 = self.self_attn(
+            src,
+            src,
+            src,
+            key_padding_mask=mask,
+            need_weights=False,
+        )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
@@ -1058,7 +1087,7 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+        x = x + self.pe[:x.size(1), :].transpose(0, 1)
         return self.dropout(x)    
 
 #%% Pooling
@@ -1105,9 +1134,10 @@ class PoolLastStepBi(nn.Module):
         self.linear = nn.Linear(input_size, output_size)
         
     def forward(self, x, n_wins=None):    
-        x = x.view(x.shape[0], n_wins.max(), 2, x.shape[-1]//2)
+        x = x.view(x.shape[0], int(n_wins.max()), 2, x.shape[-1]//2)
+        batch_indices = torch.arange(x.shape[0], device=x.device)
         x = torch.cat(
-            (x[torch.arange(x.shape[0]), n_wins.type(torch.long)-1, 0, :],
+            (x[batch_indices, n_wins.to(device=x.device, dtype=torch.long)-1, 0, :],
             x[:,0,1,:]),
             dim=1
             )
@@ -1124,7 +1154,8 @@ class PoolLastStep(nn.Module):
         self.linear = nn.Linear(input_size, output_size)
         
     def forward(self, x, n_wins=None):    
-        x = x[torch.arange(x.shape[0]), n_wins.type(torch.long)-1]
+        batch_indices = torch.arange(x.shape[0], device=x.device)
+        x = x[batch_indices, n_wins.to(device=x.device, dtype=torch.long)-1]
         x = self.linear(x)
         return x        
 
@@ -1143,8 +1174,8 @@ class PoolAtt(torch.nn.Module):
         att = self.linear1(x)
         
         att = att.transpose(2,1)
-        mask = torch.arange(att.shape[2])[None, :] < n_wins[:, None].to('cpu').to(torch.long)
-        att[~mask.unsqueeze(1)] = float("-Inf")          
+        mask = _valid_window_mask(att.shape[2], n_wins, att.device)
+        att = att.masked_fill(~mask.unsqueeze(1), float("-Inf"))
         att = F.softmax(att, dim=2)
         x = torch.bmm(att, x) 
         x = x.squeeze(1)
@@ -1172,15 +1203,15 @@ class PoolAttFF(torch.nn.Module):
 
         att = self.linear2(self.dropout(self.activation(self.linear1(x))))
         att = att.transpose(2,1)
-        mask = torch.arange(att.shape[2])[None, :] < n_wins[:, None].to('cpu').to(torch.long)
-        att[~mask.unsqueeze(1)] = float("-Inf")          
+        mask = _valid_window_mask(att.shape[2], n_wins, att.device)
+        att = att.masked_fill(~mask.unsqueeze(1), float("-Inf"))
         att = F.softmax(att, dim=2)
-        x = torch.bmm(att, x) 
+        x = torch.bmm(att, x)
         x = x.squeeze(1)
         
         x = self.linear3(x)
         
-        return x    
+        return x
 
 class PoolAvg(torch.nn.Module):
     '''
@@ -1193,12 +1224,14 @@ class PoolAvg(torch.nn.Module):
         
     def forward(self, x, n_wins):
                 
-        mask = torch.arange(x.shape[1])[None, :] < n_wins[:, None].to('cpu').to(torch.long)
-        mask = ~mask.unsqueeze(2).to(x.device)
-        x.masked_fill_(mask, 0)
+        mask = ~_valid_window_mask(x.shape[1], n_wins, x.device).unsqueeze(2)
+        x = x.masked_fill(mask, 0)
 
-        x = torch.div(x.sum(1), n_wins.unsqueeze(1))   
-            
+        x = torch.div(
+            x.sum(1),
+            n_wins.to(device=x.device, dtype=x.dtype).unsqueeze(1),
+        )
+
         x = self.linear(x)
         
         return x
@@ -1214,9 +1247,8 @@ class PoolMax(torch.nn.Module):
         
     def forward(self, x, n_wins):
                 
-        mask = torch.arange(x.shape[1])[None, :] < n_wins[:, None].to('cpu').to(torch.long)
-        mask = ~mask.unsqueeze(2).to(x.device)
-        x.masked_fill_(mask, float("-Inf"))
+        mask = ~_valid_window_mask(x.shape[1], n_wins, x.device).unsqueeze(2)
+        x = x.masked_fill(mask, float("-Inf"))
 
         x = x.max(1)[0]
         
@@ -1417,43 +1449,57 @@ class Fusion(torch.nn.Module):
         return x
         
 #%% Evaluation 
-def predict_mos(model, ds, bs, dev, num_workers=0):    
+def predict_mos(model, ds, bs, dev, num_workers=0):
     '''
     predict_mos: predicts MOS of the given dataset with given model. Used for
     NISQA and NISQA_DE model.
-    '''       
+    '''
+    pin_memory = getattr(dev, 'type', None) == 'cuda'
     dl = DataLoader(ds,
                     batch_size=bs,
                     shuffle=False,
                     drop_last=False,
-                    pin_memory=False,
+                    pin_memory=pin_memory,
                     num_workers=num_workers)
     model.to(dev)
     model.eval()
-    with torch.no_grad():
-        y_hat_list = [ [model(xb.to(dev), n_wins.to(dev)).cpu().numpy(), yb.cpu().numpy()] for xb, yb, (idx, n_wins) in dl]
-    yy = np.concatenate( y_hat_list, axis=1 )
+    y_hat_list = []
+    with torch.inference_mode():
+        for xb, yb, (idx, n_wins) in dl:
+            xb = xb.to(dev, non_blocking=pin_memory)
+            y_hat_list.append([
+                model(xb, n_wins).cpu().numpy(),
+                yb.cpu().numpy(),
+            ])
+    yy = np.concatenate(y_hat_list, axis=1)
     y_hat = yy[0,:,0].reshape(-1,1)
     y = yy[1,:,0].reshape(-1,1)
     ds.df['mos_pred'] = y_hat.astype(dtype=float)
     return y_hat, y
 
-def predict_dim(model, ds, bs, dev, num_workers=0):     
+def predict_dim(model, ds, bs, dev, num_workers=0):
     '''
-    predict_dim: predicts MOS and dimensions of the given dataset with given 
+    predict_dim: predicts MOS and dimensions of the given dataset with given
     model. Used for NISQA_DIM model.
-    '''        
+    '''
+    pin_memory = getattr(dev, 'type', None) == 'cuda'
     dl = DataLoader(ds,
                     batch_size=bs,
                     shuffle=False,
                     drop_last=False,
-                    pin_memory=False,
+                    pin_memory=pin_memory,
                     num_workers=num_workers)
     model.to(dev)
     model.eval()
-    with torch.no_grad():
-        y_hat_list = [ [model(xb.to(dev), n_wins.to(dev)).cpu().numpy(), yb.cpu().numpy()] for xb, yb, (idx, n_wins) in dl]
-    yy = np.concatenate( y_hat_list, axis=1 )
+    y_hat_list = []
+    with torch.inference_mode():
+        for xb, yb, (idx, n_wins) in dl:
+            xb = xb.to(dev, non_blocking=pin_memory)
+            y_hat_list.append([
+                model(xb, n_wins).cpu().numpy(),
+                yb.cpu().numpy(),
+            ])
+    yy = np.concatenate(y_hat_list, axis=1)
     
     y_hat = yy[0,:,:]
     y = yy[1,:,:]
@@ -2281,11 +2327,25 @@ def segment_specs(file_path, x, seg_length, seg_hop=1, max_length=None):
                 
     return x, np.array(n_wins)
 
+@lru_cache(maxsize=32)
+def _mel_filter_bank(sr, n_fft, n_mels, fmax):
+    """Cache immutable Librosa filter banks used by repeated inference calls."""
+    return lb.filters.mel(
+        sr=sr,
+        n_fft=n_fft,
+        n_mels=n_mels,
+        fmin=0.0,
+        fmax=fmax,
+        htk=False,
+        norm='slaney',
+    ).astype(np.float32, copy=False)
+
+
 def get_librosa_melspec(
     file_path,
     sr=48e3,
-    n_fft=1024, 
-    hop_length=80, 
+    n_fft=1024,
+    hop_length=80,
     win_length=170,
     n_mels=32,
     fmax=16e3,
@@ -2293,7 +2353,7 @@ def get_librosa_melspec(
     ):
     '''
     Calculate mel-spectrograms with Librosa.
-    '''    
+    '''
     # Calc spec
     try:
         if ms_channel is not None:
@@ -2304,31 +2364,23 @@ def get_librosa_melspec(
             y, sr = lb.load(file_path, sr=sr)
     except:
         raise ValueError('Could not load file {}'.format(file_path))
-    
+
+    sr = int(sr)
     hop_length = int(sr * hop_length)
     win_length = int(sr * win_length)
 
-    S = lb.feature.melspectrogram(
-        y=y,
-        sr=sr,
-        S=None,
+    stft = lb.stft(
+        y,
         n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
         window='hann',
         center=True,
         pad_mode='reflect',
-        power=1.0,
-    
-        n_mels=n_mels,
-        fmin=0.0,
-        fmax=fmax,
-        htk=False,
-        norm='slaney',
-        )
-
-    spec = lb.core.amplitude_to_db(S, ref=1.0, amin=1e-4, top_db=80.0)
-    return spec
+    )
+    mel = _mel_filter_bank(sr, n_fft, n_mels, fmax)
+    spec = mel @ np.abs(stft)
+    return lb.core.amplitude_to_db(spec, ref=1.0, amin=1e-4, top_db=80.0)
 
 
 
