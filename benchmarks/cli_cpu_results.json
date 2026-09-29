@@ -1,0 +1,114 @@
+{
+  "cpu": "AMD Ryzen 5 5600 6-Core Processor",
+  "cpu_count": 12,
+  "torch": "2.13.0+cpu",
+  "torch_threads": 6,
+  "thread_pools": [
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 12
+    },
+    {
+      "user_api": "blas",
+      "internal_api": "openblas",
+      "num_threads": 12
+    },
+    {
+      "user_api": "openmp",
+      "internal_api": "openmp",
+      "num_threads": 6
+    }
+  ],
+  "files": 60,
+  "audio_seconds": 540.0,
+  "sample_rate": 48000,
+  "batch_size": 16,
+  "repeats": 3,
+  "includes_model_loading": true,
+  "results": [
+    {
+      "mode": "legacy",
+      "workers": 0,
+      "seconds": [
+        5.697393841997837,
+        4.32184399900143,
+        4.455677763995482
+      ],
+      "median_seconds": 4.455677763995482,
+      "max_abs_score_difference": 0.0
+    },
+    {
+      "mode": "legacy",
+      "workers": 2,
+      "seconds": [
+        5.688458328004344,
+        5.5168028170010075,
+        5.4838374750106595
+      ],
+      "median_seconds": 5.5168028170010075,
+      "max_abs_score_difference": 0.0
+    },
+    {
+      "mode": "fast",
+      "workers": 0,
+      "seconds": [
+        2.5027316069899825,
+        2.4784857940103393,
+        2.5061958389997017
+      ],
+      "median_seconds": 2.5027316069899825,
+      "max_abs_score_difference": 4.76837158203125e-07
+    },
+    {
+      "mode": "fast_uncapped",
+      "workers": 0,
+      "seconds": [
+        3.3177596390014514,
+        3.434741072996985,
+        3.181410164004774
+      ],
+      "median_seconds": 3.3177596390014514,
+      "max_abs_score_difference": 0.0
+    },
+    {
+      "mode": "fast",
+      "workers": 2,
+      "seconds": [
+        1.9687165530049242,
+        1.9503207719972124,
+        2.059894183999859
+      ],
+      "median_seconds": 1.9687165530049242,
+      "max_abs_score_difference": 4.76837158203125e-07
+    },
+    {
+      "mode": "fast",
+      "workers": 4,
+      "seconds": [
+        1.9653637250012252,
+        1.9829119080095552,
+        1.9789006849896396
+      ],
+      "median_seconds": 1.9789006849896396,
+      "max_abs_score_difference": 4.76837158203125e-07
+    },
+    {
+      "mode": "fast",
+      "workers": 8,
+      "seconds": [
+        2.22679087499273,
+        2.1485822340036975,
+        2.1449620490020607
+      ],
+      "median_seconds": 2.1485822340036975,
+      "max_abs_score_difference": 4.76837158203125e-07
+    }
+  ],
+  "checkpoint": "weights/nisqa.tar",
+  "duration_range_seconds": [
+    3,
+    15
+  ],
+  "seed": 216
+}

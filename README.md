@@ -187,6 +187,35 @@ python run_predict.py --mode predict_csv --pretrained_model weights/nisqa.tar --
 
 The results will be printed to the console and saved to a csv file in a given folder (optional with --output_dir). To speed up the prediction, the number of workers and batch size of the Pytorch Dataloader can be increased (optional with --num_workers and --bs). In case of stereo files --ms_channel can be used to select the audio channel.
 
+### Fast CLI prediction
+
+`run_predict.py` and `nisqaModel.predict()` now use batch-max padding for all
+three shipped checkpoints. Directory/CSV prediction defaults to
+`min(8, os.cpu_count() or 1)` workers; single-file prediction defaults to 0.
+`--num_workers` overrides this, and `--worker_threads` defaults to 1, capping
+BLAS/OpenMP pools per worker. With 0 workers, only BLAS pools are temporarily
+capped, preserving PyTorch CPU parallelism and restoring pools on return.
+For many files, use `--bs 32` to amortize model and loader overhead.
+
+`--legacy_padding` restores original fixed padding, uncapped threads, and
+the old default of 0 workers (explicit `--num_workers` still applies).
+`--worker_threads 0` disables thread caps while keeping batch-max padding.
+Python callers can pass `legacy_padding`, `worker_threads`, and
+`tr_num_workers` in the `nisqaModel` argument dictionary.
+Double-ended models and unsegmented custom checkpoints automatically use
+the legacy path; double-ended CSV prediction accepts `--csv_ref`.
+
+CSV format, row order, and dimension mapping remain unchanged:
+MOS, noisiness, discontinuity, coloration, loudness. Batch-max padding can
+change floating-point reduction order slightly; generated-WAV tests compare
+all shipped checkpoints with legacy scores within `1e-4`, and capped workers
+with 0 workers within `1e-5`.
+
+To reproduce the CPU benchmark (60 generated WAVs, three repetitions), run
+`CUDA_VISIBLE_DEVICES='' python -m benchmarks.benchmark_cli_prediction --work_dir /path/to/scratch --output results.json`.
+Use a fresh scratch directory on a disk with enough space for audio and caches.
+Recorded CPU measurements are in [benchmarks/cli_cpu_results.json](benchmarks/cli_cpu_results.json).
+
 ### Training
 
 #### Finetuning / Transfer Learning
@@ -274,4 +303,3 @@ The NISQA Corpus is provided under the original terms of the used source speech 
 
 Copyright © 2021 Gabriel Mittag  
 www.qu.tu-berlin.de
-

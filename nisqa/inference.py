@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -132,19 +133,31 @@ def predict_dataset(
 
     Equivalent to ``NISQA_lib.predict_mos``/``predict_dim`` on the same
     features (output columns in model order, see ``DIM_COLUMNS``), within
-    float reduction-order differences. ``worker_threads`` applies only when
-    ``num_workers > 0``; use 0 to keep library defaults.
+    float reduction-order differences. ``worker_threads`` caps worker pools,
+    or just BLAS in the calling process when ``num_workers == 0``; the latter
+    leaves PyTorch's CPU parallelism intact. Limits are restored on return.
+    Use 0 to keep library thread defaults.
     """
+    pin_memory = torch.device(device).type == "cuda"
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
-        pin_memory=False,
+        pin_memory=pin_memory,
         num_workers=num_workers,
         collate_fn=BatchMaxPadCollate(max_segments),
         worker_init_fn=LimitWorkerThreads(worker_threads) if worker_threads > 0 and num_workers > 0 else None,
     )
     model.to(device).eval()
-    outputs = [predict_batch(model, x.to(device), n_wins).cpu().numpy() for x, _y, (_idx, n_wins) in loader]
+    limits = nullcontext()
+    if num_workers == 0 and worker_threads > 0:
+        from threadpoolctl import threadpool_limits
+
+        limits = threadpool_limits(worker_threads, user_api="blas")
+    with limits:
+        outputs = [
+            predict_batch(model, x.to(device, non_blocking=pin_memory), n_wins).cpu().numpy()
+            for x, _y, (_idx, n_wins) in loader
+        ]
     return np.concatenate(outputs, axis=0)

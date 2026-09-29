@@ -7,6 +7,7 @@ import os
 from glob import glob
 import datetime
 from pathlib import Path
+from .inference import DIM_COLUMNS, predict_dataset
 
 import numpy as np
 import pandas as pd; pd.options.mode.chained_assignment=None
@@ -25,6 +26,7 @@ class nisqaModel(object):
     '''      
     def __init__(self, args):
         self.args = args
+        prediction_workers = args.get('tr_num_workers')
         
         if 'mode' not in self.args:
             self.args['mode'] = 'main'
@@ -32,6 +34,8 @@ class nisqaModel(object):
         self.runinfos = {}       
         self._getDevice()
         self._loadModel()
+        if self.args['mode'] in ('predict_file', 'predict_dir', 'predict_csv'):
+            self._configurePrediction(prediction_workers)
         self._loadDatasets()
         self.args['now'] = datetime.datetime.today()
         
@@ -56,7 +60,21 @@ class nisqaModel(object):
         if self.args['tr_parallel']:
             self.model = nn.DataParallel(self.model)           
         
-        if self.args['dim']==True:
+        if getattr(self, '_fast_prediction', False):
+            y_val_hat = predict_dataset(
+                self.model,
+                self.ds_val,
+                batch_size=self.args['tr_bs_val'],
+                device=self.dev,
+                num_workers=self.args['tr_num_workers'],
+                max_segments=self.args['ms_max_segments'],
+                worker_threads=self.args['worker_threads'],
+            )
+            columns = DIM_COLUMNS if self.args['dim'] else ('mos_pred',)
+            for index, column in enumerate(columns):
+                values = y_val_hat[:, index]
+                self.ds_val.df[column] = values if self.args['dim'] else values.astype(float)
+        elif self.args['dim']==True:
             y_val_hat, y_val = NL.predict_dim(
                 self.model, 
                 self.ds_val, 
@@ -79,6 +97,27 @@ class nisqaModel(object):
             
         print(self.ds_val.df.to_string(index=False))
         return self.ds_val.df
+
+    def _configurePrediction(self, num_workers):
+        # Double-ended and unsegmented inputs require the stock collator.
+        self._fast_prediction = (
+            not self.args.get('legacy_padding', False)
+            and not self.args['double_ended']
+            and self.args['ms_seg_length'] is not None
+        )
+        if not self._fast_prediction and not self.args.get('legacy_padding', False):
+            print('---> Double-ended or unsegmented inputs use legacy prediction')
+        if num_workers is None:
+            num_workers = (
+                min(8, os.cpu_count() or 1)
+                if self._fast_prediction and self.args['mode'] != 'predict_file'
+                else 0
+            )
+        self.args['tr_num_workers'] = num_workers
+        self.args.setdefault('worker_threads', 1)
+        if num_workers < 0 or self.args['worker_threads'] < 0:
+            raise ValueError('num_workers and worker_threads must be non-negative')
+        self._prediction_max_length = None if self._fast_prediction else self.args['ms_max_segments']
 
     def _train_mos(self):
         '''
@@ -759,7 +798,7 @@ class nisqaModel(object):
             filename_column = 'deg',
             mos_column = 'predict_only',              
             seg_length = self.args['ms_seg_length'],
-            max_length = self.args['ms_max_segments'],
+            max_length = self._prediction_max_length,
             to_memory = None,
             to_memory_workers = None,
             seg_hop_length = self.args['ms_seg_hop_length'],
@@ -790,7 +829,7 @@ class nisqaModel(object):
             filename_column = 'deg',
             mos_column = 'predict_only',              
             seg_length = self.args['ms_seg_length'],
-            max_length = self.args['ms_max_segments'],
+            max_length = self._prediction_max_length,
             to_memory = None,
             to_memory_workers = None,
             seg_hop_length = self.args['ms_seg_hop_length'],
@@ -808,7 +847,7 @@ class nisqaModel(object):
         )
                 
         
-    def _loadDatasetsCSVpredict(self):         
+    def _loadDatasetsCSVpredict(self):
         '''
         Loads validation dataset for prediction only.
         '''            
@@ -829,7 +868,7 @@ class nisqaModel(object):
             filename_column = self.args['csv_deg'],
             mos_column = 'predict_only',              
             seg_length = self.args['ms_seg_length'],
-            max_length = self.args['ms_max_segments'],
+            max_length = self._prediction_max_length,
             to_memory = False,
             to_memory_workers = None,
             seg_hop_length = self.args['ms_seg_hop_length'],

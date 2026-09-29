@@ -74,3 +74,33 @@ def test_collate_pads_and_keeps_stock_guard() -> None:
     assert n_wins.tolist() == [3, 7] and index.tolist() == [0, 1] and y.shape == (2, 5)
     with pytest.raises(ValueError, match="max_length"):
         BatchMaxPadCollate(5)([ds[1]])
+
+
+@pytest.mark.parametrize("fail", (False, True))
+def test_single_process_blas_cap_is_scoped(fail) -> None:
+    from threadpoolctl import threadpool_info
+
+    def blas_threads():
+        return {pool["filepath"]: pool["num_threads"] for pool in threadpool_info() if pool["user_api"] == "blas"}
+
+    before = blas_threads()
+    torch_threads = torch.get_num_threads()
+    observed = []
+
+    class Specs(_Specs):
+        def __getitem__(self, index):
+            observed.append(blas_threads())
+            assert torch.get_num_threads() == torch_threads
+            if fail:
+                raise RuntimeError("feature extraction failed")
+            return super().__getitem__(index)
+
+    model = load_model(ROOT / "weights" / "nisqa.tar")
+    ds = Specs([3, 5])
+    if fail:
+        with pytest.raises(RuntimeError, match="feature extraction failed"):
+            predict_dataset(model, ds, batch_size=2, worker_threads=1)
+    else:
+        predict_dataset(model, ds, batch_size=2, worker_threads=1)
+    assert observed and all(threads == 1 for pools in observed for threads in pools.values())
+    assert blas_threads() == before
