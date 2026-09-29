@@ -102,6 +102,33 @@ Inference policy is shape-aware:
 - CPU `n_wins` is supported, avoiding unnecessary length-tensor transfers.
 - CUDA DataLoaders use pinned memory and non-blocking feature transfers.
 
+### Scoring many files: batch-max padding and thread-capped workers
+
+`predict_dataset` scores a `SpeechQualityDataset` built with `max_length=None`.
+Segments are padded to the longest file in each batch instead of
+`ms_max_segments` (the models pack by `n_wins`, so the extra padding never
+reached them), and each DataLoader worker caps its BLAS/OpenMP pools
+(`worker_threads`, default 1, via `threadpoolctl`). Forked workers otherwise
+inherit host-sized pools and oversubscribe the CPU in librosa's FFT/mel work.
+
+```python
+from nisqa import DIM_COLUMNS, load_model, predict_dataset
+
+model = load_model("weights/nisqa.tar", device="cuda")
+# dataset = NISQA_lib.SpeechQualityDataset(..., max_length=None, ...)
+scores = predict_dataset(model, dataset, batch_size=32, device="cuda",
+                         num_workers=8, max_segments=args["ms_max_segments"])
+# scores[:, k] is DIM_COLUMNS[k] (predict_dim column order)
+```
+
+Measured on a Colab G4 (48 vCPU, RTX PRO 6000) scoring 381 real speech chunks
+(3,492 s): 25.3 s with stock `run_predict.py` (0 workers), 16.5 s with 2
+workers, 1.6 s with batch-max padding and 8 workers capped to one thread each.
+Scores stayed within 1.3e-5 of stock (float reduction order) and all
+downstream quality tiers were identical. Equal-length and single-item batches
+take the dense path; `tests/test_batch_max_padding.py` checks them against
+fixed padding.
+
 `torch.compile` is supported as an opt-in optimization for fixed-shape,
 fully-valid buckets. Warm it up before measuring steady-state latency:
 
